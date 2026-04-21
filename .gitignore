@@ -15,6 +15,9 @@ config.json
 *.key
 *.pem
 
+# Claude Code personal settings
+.claude/settings.local.json
+
 # Generated images
 *.png
 *.jpg
