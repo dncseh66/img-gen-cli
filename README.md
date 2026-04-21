@@ -1,4 +1,4 @@
-# image_gen
+# img-gen-cli
 
 An interactive CLI that turns YouTube video scripts into AI-generated story images. It splits each script into ~1000-word segments, uses Claude to write image prompts, optionally generates a historically-consistent visual style per video, and then renders images via the [kie.ai](https://kie.ai) API (NanoBanana 2 or NanoBanana Pro).
 
@@ -21,8 +21,8 @@ Designed for long-form "sleep video"–style content where every image of a give
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/image_gen.git
-cd image_gen
+git clone https://github.com/dncseh66/img-gen-cli.git
+cd img-gen-cli
 python -m venv .venv
 # Windows:
 .venv\Scripts\activate
