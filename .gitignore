@@ -35,3 +35,6 @@ config.json
 .DS_Store
 Thumbs.db
 
+# Local test / scratch scripts
+test_download_by_task_id.py
+

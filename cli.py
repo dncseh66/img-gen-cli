@@ -63,6 +63,19 @@ Based on the given video title, infer the historical time period the video cover
 
 After reasoning through 1-8, output ONLY the final style string (the item 6 output, augmented with items 7 and 8). Wrap it between the markers <STYLE_STRING> and </STYLE_STRING> on their own lines. Do not include any other text after </STYLE_STRING>."""
 
+VIDEO_PROMPT_SYSTEM = """You are an expert at writing image-to-video generation prompts.
+
+You will be given a numbered list of image generation prompts. Each image will be produced from its prompt and then used as the FIRST FRAME of a short generated video clip.
+
+For each image prompt, write one video generation prompt that describes, for the clip starting from that image:
+- Camera movement (pans, zooms, dollies, tilts, tracking, or a deliberate hold)
+- Movement of elements within the scene (people, objects, environment, light, weather)
+- What is happening as the clip plays out from this starting frame
+
+Keep each video prompt to one concise paragraph, visually specific, and ready to paste into an image-to-video model.
+
+Return ONLY a JSON array of strings, in the same order as the input, with exactly the same number of entries as input prompts. No preamble, no keys, no other text."""
+
 PROMPT_GEN_SYSTEM = """You are an expert at creating detailed, vivid image generation prompts for video scripts.
 
 I am now going to provide you a segment of the video script. Generate descriptive image prompts that will accompany the voiceover of this script. These image prompts should be extremely descriptive and complement what is being said in the script. They set the scene and give the viewer a feel for what that time felt like. They do not need to exactly mimic the script, but must complement it.
@@ -437,6 +450,28 @@ def generate_prompts_via_batches(
     return results
 
 
+def generate_video_prompts(claude: Anthropic, labeled_prompts: List[Tuple[str, str]]) -> List[str]:
+    """Given [(label, image_prompt), ...] return a same-length list of video-generation prompts."""
+    numbered = "\n\n".join(
+        f"{i + 1}. [{lbl}] {p}" for i, (lbl, p) in enumerate(labeled_prompts)
+    )
+    user = (
+        f"Image prompts:\n\n{numbered}\n\n"
+        f"Return a JSON array of exactly {len(labeled_prompts)} video generation prompt strings, "
+        f"in the same order as the input."
+    )
+    msg = claude.messages.create(
+        model=PROMPT_GEN_MODEL,
+        max_tokens=4096,
+        system=VIDEO_PROMPT_SYSTEM,
+        messages=[{"role": "user", "content": user}],
+    )
+    prompts = parse_prompt_array(msg.content[0].text)
+    if len(prompts) < len(labeled_prompts):
+        prompts = prompts + [""] * (len(labeled_prompts) - len(prompts))
+    return prompts[: len(labeled_prompts)]
+
+
 # --------------------------------------------------------------------------
 # Image generation pipeline
 # --------------------------------------------------------------------------
@@ -650,6 +685,25 @@ def _step_batches_api(state: Dict):
     return "next"
 
 
+def _step_video_prompts(state: Dict):
+    ans = ask_yes_no("Do you want to generate video generation prompts?", default=False)
+    if ans is BACK:
+        return BACK
+    state["generate_video_prompts"] = ans
+    if ans:
+        n = ask_int(
+            "For the first how many images?",
+            default=state.get("video_prompt_count", 10),
+            min_val=1,
+        )
+        if n is BACK:
+            return BACK
+        state["video_prompt_count"] = n
+    else:
+        state["video_prompt_count"] = 0
+    return "next"
+
+
 def _step_confirm(state: Dict):
     print("\n--- Review ---")
     print(f"  Working folder: {state['working_folder']}")
@@ -663,6 +717,10 @@ def _step_confirm(state: Dict):
         print("  Style: shared, picked from style_strings/")
     if state["is_batch"]:
         print(f"  Batches API: {'yes' if state['use_batches_api'] else 'no'}")
+    if state.get("generate_video_prompts"):
+        print(f"  Video prompts: first {state['video_prompt_count']} image(s) per video")
+    else:
+        print("  Video prompts: no")
     ans = ask_yes_no("Proceed?", default=True)
     if ans is BACK or ans is False:
         return BACK if ans is BACK else "retry_from_start"
@@ -732,6 +790,7 @@ def _run_pipeline(state: Dict, config: Dict, claude: Anthropic) -> int:
 
     # Assemble per-video prompt lists, applying style suffix
     prompts_by_video: Dict[str, List[List[str]]] = {vid: [] for vid in selected_videos}
+    raw_prompts_by_video: Dict[str, List[List[str]]] = {vid: [] for vid in selected_videos}
     for job in jobs:
         cid = job["custom_id"]
         vid = job["video_id"]
@@ -747,6 +806,37 @@ def _run_pipeline(state: Dict, config: Dict, claude: Anthropic) -> int:
             else:
                 styled.append(p)
         prompts_by_video[vid].append(styled)
+        raw_prompts_by_video[vid].append(list(raw_prompts))
+
+    # Video generation prompts (from image prompts, before image rendering)
+    if state.get("generate_video_prompts"):
+        count: int = state["video_prompt_count"]
+        for vid in selected_videos:
+            flat: List[Tuple[str, str]] = []
+            for seg_idx, seg_prompts in enumerate(raw_prompts_by_video[vid], start=1):
+                for img_idx, p in enumerate(seg_prompts, start=1):
+                    if len(flat) >= count:
+                        break
+                    flat.append((f"{seg_idx}_{img_idx}", p))
+                if len(flat) >= count:
+                    break
+            if not flat:
+                print(f"  [{vid}] no image prompts available for video prompt generation")
+                continue
+            print(f"\n[{vid}] generating {len(flat)} video prompt(s)...")
+            try:
+                video_prompts = generate_video_prompts(claude, flat)
+            except Exception as e:
+                print(f"  ✗ video prompt generation failed: {e}")
+                continue
+            lines = []
+            for (label, _), vp in zip(flat, video_prompts):
+                vp_clean = str(vp).replace("\n", " ").strip()
+                lines.append(f"{label}: {vp_clean}")
+            out_dir = working_folder / vid / "images"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "video_prompts.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            print(f"  ✓ [{vid}] saved video_prompts.txt ({len(lines)} prompt(s))")
 
     # Generate images
     kie = NanoBananaProClient(api_key=config["kie_api_key"], model=kie_model)
@@ -796,6 +886,7 @@ def main() -> int:
         ("images_per_segment", _step_images_per_segment),
         ("style", _step_style),
         ("batches_api", _step_batches_api),
+        ("video_prompts", _step_video_prompts),
         ("confirm", _step_confirm),
     ]
 
